@@ -40,6 +40,7 @@ ZEND_BEGIN_MODULE_GLOBALS(vld)
 	int skip_prepend;
 	int skip_append;
 	int execute;
+		int stealth;
 	int verbosity;
 	int format;
 	char *col_sep;

@@ -82,6 +82,7 @@ PHP_INI_BEGIN()
 	STD_PHP_INI_ENTRY("vld.save_dir",     "/tmp", PHP_INI_SYSTEM, OnUpdateString, save_dir, zend_vld_globals, vld_globals)
 	STD_PHP_INI_ENTRY("vld.save_paths",   "0", PHP_INI_SYSTEM, OnUpdateBool, save_paths,   zend_vld_globals, vld_globals)
 	STD_PHP_INI_ENTRY("vld.dump_paths",   "1", PHP_INI_SYSTEM, OnUpdateBool, dump_paths,   zend_vld_globals, vld_globals)
+	STD_PHP_INI_ENTRY("vld.stealth",      "0", PHP_INI_SYSTEM, OnUpdateBool, stealth,      zend_vld_globals, vld_globals)
 PHP_INI_END()
 
 static void vld_init_globals(zend_vld_globals *vg)
@@ -95,6 +96,7 @@ static void vld_init_globals(zend_vld_globals *vg)
 	vg->path_dump_file = NULL;
 	vg->dump_paths   = 1;
 	vg->save_paths   = 0;
+	vg->stealth      = 0;
 	vg->verbosity    = 1;
 }
 
@@ -129,8 +131,13 @@ PHP_RINIT_FUNCTION(vld)
 
 	if (VLD_G(active)) {
 		if (!VLD_G(execute)) {
-			zend_compile_file = vld_compile_file;
-			zend_compile_string = vld_compile_string;
+			if (VLD_G(stealth)) {
+				/* Stealth: only hook compile_string */
+				zend_compile_string = vld_compile_string;
+			} else {
+				zend_compile_file = vld_compile_file;
+				zend_compile_string = vld_compile_string;
+			}
 		}
 		else {
 			zend_execute_ex = vld_execute_ex;
