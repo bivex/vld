@@ -70,7 +70,7 @@ class ClassDump:
 OPCODE_RE = re.compile(
     r"^\s*(\d+)(\*?)\s+"   # idx
     r"([E ])\s*"           # entry marker
-    r"(>)?\s*"             # jump target marker
+    r"(?:>\s*)*"           # zero or more > jump target markers
     r"([A-Z_][A-Z0-9_]*)"  # opcode name
     r"(.*)"                # rest of line
 )
@@ -250,8 +250,8 @@ def parse_dump(text: str) -> List[ClassDump]:
             if m:
                 idx = int(m.group(1))
                 is_dead = m.group(2) == "*"
-                opcode = m.group(5)
-                rest = m.group(6)
+                opcode = m.group(4)
+                rest = m.group(5)
 
                 ext_val, ret_var, operands_raw = parse_operands_raw(rest, m.end())
 
@@ -354,6 +354,74 @@ class PHPReconstructor:
             return ""
         return func.compiled_vars.get(var, var)
 
+    def _find_catch_blocks(self, ops: List[OpLine]) -> dict:
+        """Analyze opcodes to find try/catch structure.
+
+        PHP 8.3 VLD pattern:
+          [try body ops]
+          JMP ->after_catch       (skip catch on success)
+          CATCH 'ExceptionType'   (entry point on exception, has E flag)
+          [catch body ops]
+          JMP ->continue          (continue after try/catch)
+
+        Returns dict: catch_pos -> {try_start, skip_jmp_idx, catch_end, exc_type}
+        """
+        catches = {}
+        for i, op in enumerate(ops):
+            if op.opcode != "CATCH":
+                continue
+            # Parse CATCH operands: "last 'Throwable'" or just "'Exception'"
+            catch_opds_raw = op.operands_raw.strip()
+            exc_type = "Exception"
+            # Find quoted string in operands
+            m_exc = re.search(r"'([^']+)'", catch_opds_raw)
+            if m_exc:
+                exc_type = decode_str(m_exc.group(1))
+
+            # Find the JMP before this CATCH (skip-catch jump)
+            skip_jmp = None
+            skip_jmp_idx = None
+            for j in range(i - 1, max(i - 8, -1), -1):
+                if ops[j].opcode == "JMP" and not ops[j].is_dead:
+                    skip_jmp = ops[j]
+                    skip_jmp_idx = j
+                    break
+
+            if not skip_jmp:
+                continue
+
+            # Target of skip JMP = position after catch block
+            jmp_opds = split_operands(skip_jmp.operands_raw)
+            if not jmp_opds:
+                continue
+            try:
+                catch_end = int(jmp_opds[0].lstrip("->"))
+            except ValueError:
+                continue
+
+            # try_start: code between last flow control point and skip_jmp
+            # Walk back from skip_jmp to find the first op that's a branch target
+            # or a flow control point (JMPZ, FE_FETCH, etc)
+            try_start = 0
+            for j in range(skip_jmp_idx - 1, -1, -1):
+                if ops[j].opcode in ("RECV", "RECV_INIT"):
+                    try_start = j + 1
+                    break
+                # FE_FETCH, JMPZ etc are loop/branch targets — try starts after them
+                if ops[j].opcode in ("FE_FETCH_R", "FE_FETCH_RW", "JMPZ", "JMPNZ",
+                                     "JMPZ_EX", "JMPNZ_EX"):
+                    try_start = j + 1
+                    break
+
+            catches[i] = {
+                "try_start": try_start,
+                "skip_jmp_idx": skip_jmp_idx,
+                "catch_end": catch_end,
+                "exc_type": exc_type,
+            }
+
+        return catches
+
     def _function(self, func: FuncDump) -> str:
         ops = func.ops
         fname = func.name
@@ -381,13 +449,73 @@ class PHPReconstructor:
         # -- Phase 1: build renaming map from opcode analysis --
         renames = self._build_renames(func)
 
+        # -- Phase 2: find try/catch blocks --
+        catch_map = self._find_catch_blocks(ops)
+
+        # Build sets of indices to suppress
+        skip_indices = set()
+        for ci, info in catch_map.items():
+            skip_indices.add(info["skip_jmp_idx"])  # suppress skip-catch JMP
+            skip_indices.add(ci)  # suppress CATCH opcode itself
+
+        # Build a map of catch_end positions -> catch_info (for closing braces)
+        catch_end_targets = {}
+        for ci, info in catch_map.items():
+            catch_end_targets[info["catch_end"]] = ci
+
+        # Track open braces for try/catch nesting
+        brace_stack = []  # list of ("try"|"catch", indent_level)
+
+        def current_inner():
+            return indent + "    " + "    " * len(brace_stack)
+
         for idx, op in enumerate(ops):
             if op.is_dead:
                 continue
+            if idx in skip_indices:
+                continue
+
+            # Check if we need to close any blocks at this position
+            while brace_stack:
+                btype, end_pos = brace_stack[-1]
+                if idx >= end_pos:
+                    brace_stack.pop()
+                    close_indent = indent + "    " + "    " * len(brace_stack)
+                    if btype == "try":
+                        # Close try, open catch — end_pos is the catch instruction index
+                        info = catch_map.get(end_pos)
+                        if info is not None:
+                            exc = info["exc_type"]
+                            lines.append(f"{close_indent}}} catch ({exc} $e) {{\n")
+                            brace_stack.append(("catch", info["catch_end"]))
+                    else:
+                        lines.append(f"{close_indent}}}\n")
+                else:
+                    break
+
+            # Check if a try block starts at this position
+            for ci, info in catch_map.items():
+                if info["try_start"] == idx:
+                    lines.append(f"{current_inner()}try {{\n")
+                    brace_stack.append(("try", ci))
+                    break
+
+            use_inner = current_inner()
+
             code = self._op(op, func, call_stack, ops, idx)
             if code:
                 code = self._apply_renames(code, renames)
-                lines.append(f"{inner}{code}\n")
+                lines.append(f"{use_inner}{code}\n")
+
+        # Close remaining open braces
+        while brace_stack:
+            btype, _ = brace_stack.pop()
+            close_indent = indent + "    " + "    " * len(brace_stack)
+            if btype == "try":
+                lines.append(f"{close_indent}}} catch (\\Throwable $e) {{\n")
+                brace_stack.append(("catch", len(ops)))
+            else:
+                lines.append(f"{close_indent}}}\n")
 
         lines.append(f"{indent}}}\n\n")
         return "".join(lines)
