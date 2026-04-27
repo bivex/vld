@@ -312,6 +312,16 @@ def fmt(tok: str) -> str:
         return tok
     if tok == "<array>":
         return "[]"
+    # VLD constant markers
+    if tok == "<true>":
+        return "true"
+    if tok == "<false>":
+        return "false"
+    if tok == "<null>":
+        return "null"
+    m = re.match(r"^<const\s+(.+)>$", tok)
+    if m:
+        return m.group(1)
     if re.match(r"^-?\d+$", tok):
         return tok
     return decode_str(tok)
@@ -610,7 +620,7 @@ class PHPReconstructor:
         # -- Return --
         if o == "RETURN":
             if opds:
-                return f"return {fmt(opds[0])};"
+                return f"return {rv(fmt(opds[0]))};"
             if ret:
                 return f"return {rv(ret)};"
             return "return;"
@@ -619,7 +629,7 @@ class PHPReconstructor:
         if o == "ASSIGN":
             if len(opds) >= 2:
                 target = rv(opds[0])
-                val = fmt(opds[1])
+                val = rv(fmt(opds[1]))
                 return f"{target} = {val};"
 
         # -- ASSIGN_OBJ + OP_DATA pattern --
@@ -666,7 +676,7 @@ class PHPReconstructor:
         if o in ("FETCH_DIM_R", "FETCH_DIM_W", "FETCH_DIM_IS"):
             if len(opds) >= 2:
                 arr = rv(fmt(opds[0]))
-                key = fmt(opds[1])
+                key = rv(fmt(opds[1]))
                 if ret:
                     return f"{rv(ret)} = {arr}[{key}];"
             return None
@@ -697,6 +707,10 @@ class PHPReconstructor:
             return None
 
         if o == "INIT_STATIC_METHOD_CALL":
+            if not opds:
+                # Empty operands = parent::__construct
+                cs.append({"t": "s", "cls": "parent", "fn": "__construct", "args": []})
+                return None
             parts_list = [fmt(p).strip("'") for p in opds]
             if len(parts_list) >= 2:
                 cls_name = parts_list[0]
@@ -710,7 +724,15 @@ class PHPReconstructor:
             cs.append({"t": "s", "cls": cls_name, "fn": method, "args": []})
             return None
 
-        if o in ("INIT_FCALL", "INIT_FCALL_BY_NAME", "INIT_NS_FCALL_BY_NAME"):
+        if o == "INIT_NS_FCALL_BY_NAME":
+            fname = fmt(opds[0]).strip("'") if opds else ""
+            # NS call like Component\...\sprintf — extract bare function name
+            if "\\" in fname:
+                fname = fname.rsplit("\\", 1)[-1]
+            cs.append({"t": "f", "fn": fname, "args": []})
+            return None
+
+        if o in ("INIT_FCALL", "INIT_FCALL_BY_NAME"):
             fname = fmt(opds[0]).strip("'") if opds else ""
             cs.append({"t": "f", "fn": fname, "args": []})
             return None
@@ -795,7 +817,7 @@ class PHPReconstructor:
         if o in ("IS_SMALLER", "IS_SMALLER_OR_EQUAL", "IS_EQUAL",
                   "IS_NOT_EQUAL", "IS_IDENTICAL", "IS_NOT_IDENTICAL"):
             if len(opds) >= 2 and ret:
-                a, b = rv(fmt(opds[0])), fmt(opds[1])
+                a, b = rv(fmt(opds[0])), rv(fmt(opds[1]))
                 op_map = {"IS_SMALLER": "<", "IS_SMALLER_OR_EQUAL": "<=",
                           "IS_EQUAL": "==", "IS_NOT_EQUAL": "!=",
                           "IS_IDENTICAL": "===", "IS_NOT_IDENTICAL": "!=="}
@@ -828,7 +850,7 @@ class PHPReconstructor:
         if o in ("ADD", "SUB", "MUL", "DIV", "MOD"):
             if len(opds) >= 2 and ret:
                 op_map = {"ADD": "+", "SUB": "-", "MUL": "*", "DIV": "/", "MOD": "%"}
-                a, b = rv(fmt(opds[0])), fmt(opds[1])
+                a, b = rv(fmt(opds[0])), rv(fmt(opds[1]))
                 return f"{rv(ret)} = {a} {op_map[o]} {b};"
             return None
 
@@ -852,7 +874,7 @@ class PHPReconstructor:
         if o == "INIT_ARRAY":
             if ret:
                 if len(opds) >= 2:
-                    return f"{rv(ret)} = [{fmt(opds[1])} => {rv(fmt(opds[0]))}];"
+                    return f"{rv(ret)} = [{rv(fmt(opds[1]))} => {rv(fmt(opds[0]))}];"
                 if opds:
                     return f"{rv(ret)} = [{rv(fmt(opds[0]))}];"
                 return f"{rv(ret)} = [];"
@@ -861,7 +883,7 @@ class PHPReconstructor:
         if o == "ADD_ARRAY_ELEMENT":
             if ret:
                 if len(opds) >= 2:
-                    return f"{rv(ret)}[{fmt(opds[1])}] = {rv(fmt(opds[0]))};"
+                    return f"{rv(ret)}[{rv(fmt(opds[1]))}] = {rv(fmt(opds[0]))};"
                 if opds:
                     return f"{rv(ret)}[] = {rv(fmt(opds[0]))};"
             return None
@@ -879,7 +901,7 @@ class PHPReconstructor:
         # -- CONCAT --
         if o == "CONCAT":
             if len(opds) >= 2 and ret:
-                a, b = rv(fmt(opds[0])), fmt(opds[1])
+                a, b = rv(fmt(opds[0])), rv(fmt(opds[1]))
                 return f"{rv(ret)} = {a} . {b};"
             return None
 
