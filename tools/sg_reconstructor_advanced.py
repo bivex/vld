@@ -19,6 +19,34 @@ from typing import List, Dict, Optional, Tuple
 
 
 def decode_str(s: str) -> str:
+    if not s:
+        return ""
+    s = s.strip()
+
+    # Map special VLD literals
+    mapping = {
+        "<array>": "[]",
+        "<true>": "true",
+        "<false>": "false",
+        "<null>": "null",
+    }
+    if s in mapping:
+        return mapping[s]
+
+    # String literals in dump are often '...'
+    if s.startswith("'") and s.endswith("'"):
+        inner = s[1:-1]
+        decoded = unquote_plus(inner)
+        # Escape quotes for PHP output
+        escaped = decoded.replace("'", "\\'")
+        return f"'{escaped}'"
+
+    if s.startswith('"') and s.endswith('"'):
+        inner = s[1:-1]
+        decoded = unquote_plus(inner)
+        escaped = decoded.replace('"', '\\"')
+        return f'"{escaped}"'
+
     return unquote_plus(s)
 
 
@@ -34,6 +62,7 @@ def decode_ns(name: str) -> str:
 # line      #* E I O op                               fetch          ext  return  operands
 # The 'operands' column starts at a consistent position after the 'return' column.
 # We detect the header positions dynamically.
+
 
 class OpLine:
     __slots__ = ("idx", "opcode", "ext_val", "ret", "operands_raw", "is_dead")
@@ -68,11 +97,11 @@ class ClassDump:
 # then splitting the remainder into ext, return, operands.
 
 OPCODE_RE = re.compile(
-    r"^\s*(\d+)(\*?)\s+"   # idx
-    r"([E ])\s*"           # entry marker
-    r"(?:>\s*)*"           # zero or more > jump target markers
+    r"^\s*(\d+)(\*?)\s+"  # idx
+    r"([E ])\s*"  # entry marker
+    r"(?:>\s*)*"  # zero or more > jump target markers
     r"([A-Z_][A-Z0-9_]*)"  # opcode name
-    r"(.*)"                # rest of line
+    r"(.*)"  # rest of line
 )
 
 # The "rest" part has a specific layout:
@@ -87,14 +116,14 @@ OPCODE_RE = re.compile(
 #   "                                         8          !19, ~178"
 
 REST_RE = re.compile(
-    r"^(\s*)"                    # leading spaces (fetch area)
-    r"(?:(\d+)\s+)?"             # optional ext value
-    r"(?:([~$]\d+)\s+)?"         # optional return var
-    r"(.*)$"                     # operands
+    r"^(\s*)"  # leading spaces (fetch area)
+    r"(?:(\d+)\s+)?"  # optional ext value
+    r"(?:([~$]\d+)\s+)?"  # optional return var
+    r"(.*)$"  # operands
 )
 
 
-def parse_operands_raw(rest: str, opcode_end_pos: int) -> Tuple[str, str, str]:
+def parse_operands_raw(rest: str, line_end: int, opcode: str) -> Tuple[str, str, str]:
     """
     Given the rest of line after the opcode name, extract (ext_val, return_var, operands).
 
@@ -124,19 +153,23 @@ def parse_operands_raw(rest: str, opcode_end_pos: int) -> Tuple[str, str, str]:
         return "", "", ""
 
     # Classify tokens: ext (small int), return (~N/$N), operands (everything else)
+    # Tokens with trailing commas are operands (e.g., "$9,") — return column never has a comma
     classified = []
     for t in tokens:
-        if re.match(r"^\d+$", t) and int(t) < 10000:
-            classified.append(("ext", t))
-        elif re.match(r"^[~$]\d+$", t):
-            classified.append(("ret", t))
-        elif re.match(r"^!\d+$", t):
-            # !N could be return or operand depending on position
-            classified.append(("bang", t))
+        if t.endswith(","):
+            classified.append(("oper", t))
+            continue
+        base = t.rstrip(",")
+        if re.match(r"^\d+$", base) and int(base) < 10000:
+            classified.append(("ext", base))
+        elif re.match(r"^[!~$]\d+$", base):
+            classified.append(("ret", base))
         else:
             classified.append(("oper", t))
 
     # Walk through: first ext (if any), then ret (if any), rest is operands
+    # Special case: NEW opcode has operand (class name) BEFORE ret variable
+    operand_before_ret = opcode == "NEW"
     idx = 0
 
     # Skip ext
@@ -144,10 +177,52 @@ def parse_operands_raw(rest: str, opcode_end_pos: int) -> Tuple[str, str, str]:
         ext_val = classified[idx][1]
         idx += 1
 
-    # Check for return var (~N or $N)
-    if idx < len(classified) and classified[idx][0] in ("ret", "bang"):
-        # Only treat as return if there are operand tokens after it
-        if idx + 1 <= len(classified):
+    if operand_before_ret:
+        # NEW opcode: format varies
+        # Format 1: NEW  className  $ret  (e.g., NEW self $7) — operand first
+        # Format 2: NEW  $ret  'ClassName'  (e.g., NEW $11 'Class') — ret first (standard)
+        if idx < len(classified):
+            if classified[idx][0] == "ret" and idx + 1 < len(classified):
+                # Format 2: ret first (standard)
+                ret_var = classified[idx][1]
+                idx += 1
+            else:
+                # Format 1: operand first (className like 'self', 'static', 'parent')
+                # Capture className as operands, ret as second token
+                cls_name_token = classified[idx][1]
+                idx += 1
+                if idx < len(classified) and classified[idx][0] == "ret":
+                    ret_var = classified[idx][1]
+                    idx += 1
+                # For Format 1, operands is just the class name
+                operands = cls_name_token
+                return ext_val, ret_var, operands
+    elif idx < len(classified) and classified[idx][0] == "ret":
+        # Rule: if there are operands after it, it's definitely a return var.
+        # If it's the ONLY token, it's a return var UNLESS the opcode is RETURN/SEND/etc.
+        no_ret_opcodes = (
+            "RETURN",
+            "JMP",
+            "JMPZ",
+            "JMPNZ",
+            "JMPZ_EX",
+            "JMPNZ_EX",
+            "SEND_VAR",
+            "SEND_VAL",
+            "SEND_VAR_EX",
+            "SEND_VAR_NO_REF_EX",
+            "SEND_VAR_NO_REF",
+            "SEND_REF",
+            "SEND_USER",
+            "FE_FREE",
+            "FREE",
+            "ECHO",
+            "THROW",
+            "GOTO",
+            "VERIFY_RETURN_TYPE",
+            "OP_DATA",
+        )
+        if idx + 1 < len(classified) or opcode not in no_ret_opcodes:
             ret_var = classified[idx][1]
             idx += 1
 
@@ -163,11 +238,11 @@ def parse_operands_raw(rest: str, opcode_end_pos: int) -> Tuple[str, str, str]:
         if ext_val:
             p = raw_after_ext.find(ext_val)
             if p >= 0:
-                raw_after_ext = raw_after_ext[p + len(ext_val):]
+                raw_after_ext = raw_after_ext[p + len(ext_val) :]
         if ret_var:
             p = raw_after_ext.find(ret_var)
             if p >= 0:
-                raw_after_ext = raw_after_ext[p + len(ret_var):]
+                raw_after_ext = raw_after_ext[p + len(ret_var) :]
         operands = raw_after_ext.strip()
     else:
         # operands might be empty — the return var IS the only value
@@ -253,7 +328,9 @@ def parse_dump(text: str) -> List[ClassDump]:
                 opcode = m.group(4)
                 rest = m.group(5)
 
-                ext_val, ret_var, operands_raw = parse_operands_raw(rest, m.end())
+                ext_val, ret_var, operands_raw = parse_operands_raw(
+                    rest, m.end(), opcode
+                )
 
                 opl = OpLine(idx, opcode, ext_val, ret_var, operands_raw, is_dead)
                 current_func.ops.append(opl)
@@ -264,6 +341,7 @@ def parse_dump(text: str) -> List[ClassDump]:
 # ---------------------------------------------------------------------------
 # Operand helpers
 # ---------------------------------------------------------------------------
+
 
 def split_operands(raw: str) -> List[str]:
     """Split operand string into individual tokens, respecting quotes."""
@@ -304,10 +382,13 @@ def fmt(tok: str) -> str:
         return tok
     if tok.startswith("->"):
         return tok
-    if (tok.startswith("'") and tok.endswith("'")) or (tok.startswith('"') and tok.endswith('"')):
+    if (tok.startswith("'") and tok.endswith("'")) or (
+        tok.startswith('"') and tok.endswith('"')
+    ):
         inner = tok[1:-1]
-        inner = decode_str(inner)
-        return f"'{inner}'"
+        decoded = unquote_plus(inner)
+        escaped = decoded.replace("\\", "\\\\").replace("'", "\\'")
+        return f"'{escaped}'"
     if tok in ("null", "true", "false"):
         return tok
     if tok == "<array>":
@@ -327,9 +408,14 @@ def fmt(tok: str) -> str:
     return decode_str(tok)
 
 
+# Alias so class methods can reference the global fmt without shadowing
+fmt_global = fmt
+
+
 # ---------------------------------------------------------------------------
 # PHP reconstructor
 # ---------------------------------------------------------------------------
+
 
 class PHPReconstructor:
     def __init__(self, classes: List[ClassDump]):
@@ -342,11 +428,40 @@ class PHPReconstructor:
         return "".join(parts).rstrip() + "\n"
 
     def _class(self, cls: ClassDump) -> str:
-        parts = [f"class {cls.name}\n{{\n"]
+        name = cls.name
+        namespace = ""
+        short_name = name
+
+        if "\\" in name:
+            parts = name.rsplit("\\", 1)
+            namespace = parts[0]
+            short_name = parts[1]
+
+        lines = []
+        if namespace:
+            lines.append(f"namespace {namespace};\n\n")
+
+        # Property detection: scan __construct for ASSIGN_OBJ to $this
+        properties = set()
         for fn in cls.functions:
-            parts.append(self._function(fn))
-        parts.append("}\n\n")
-        return "".join(parts)
+            for op in fn.ops:
+                if op.opcode == "ASSIGN_OBJ":
+                    opds = split_operands(op.operands_raw)
+                    if opds and opds[0] == "$this":
+                        prop = opds[1].strip("'\"")
+                        if prop and re.match(r"^[a-zA-Z_]\w*$", prop):
+                            properties.add(prop)
+
+        lines.append(f"class {short_name}\n{{\n")
+        for prop in sorted(properties):
+            lines.append(f"    public ${prop};\n")
+        if properties:
+            lines.append("\n")
+
+        for fn in cls.functions:
+            lines.append(self._function(fn))
+        lines.append("}\n\n")
+        return "".join(lines)
 
     def _rv(self, var: str, func: FuncDump) -> str:
         """Resolve VLD var name to PHP var name."""
@@ -354,73 +469,118 @@ class PHPReconstructor:
             return ""
         return func.compiled_vars.get(var, var)
 
-    def _find_catch_blocks(self, ops: List[OpLine]) -> dict:
-        """Analyze opcodes to find try/catch structure.
+    def _find_blocks(self, ops: List[OpLine]) -> Dict[int, Dict]:
+        """Analyze opcodes to find if, else, foreach, and try/catch blocks."""
+        blocks = {}  # start_idx -> block_info
 
-        PHP 8.3 VLD pattern:
-          [try body ops]
-          JMP ->after_catch       (skip catch on success)
-          CATCH 'ExceptionType'   (entry point on exception, has E flag)
-          [catch body ops]
-          JMP ->continue          (continue after try/catch)
-
-        Returns dict: catch_pos -> {try_start, skip_jmp_idx, catch_end, exc_type}
-        """
-        catches = {}
+        # 1. Detect Try/Catch (already implemented in specialized way)
         for i, op in enumerate(ops):
-            if op.opcode != "CATCH":
-                continue
-            # Parse CATCH operands: "last 'Throwable'" or just "'Exception'"
-            catch_opds_raw = op.operands_raw.strip()
-            exc_type = "Exception"
-            # Find quoted string in operands
-            m_exc = re.search(r"'([^']+)'", catch_opds_raw)
-            if m_exc:
-                exc_type = decode_str(m_exc.group(1))
+            if op.opcode == "CATCH":
+                catch_opds_raw = op.operands_raw.strip()
+                exc_type = "Exception"
+                m_exc = re.search(r"'([^']+)'", catch_opds_raw)
+                if m_exc:
+                    exc_type = decode_str(m_exc.group(1))
 
-            # Find the JMP before this CATCH (skip-catch jump)
-            skip_jmp = None
-            skip_jmp_idx = None
-            for j in range(i - 1, max(i - 8, -1), -1):
-                if ops[j].opcode == "JMP" and not ops[j].is_dead:
-                    skip_jmp = ops[j]
-                    skip_jmp_idx = j
-                    break
+                skip_jmp_idx = None
+                for j in range(i - 1, max(i - 8, -1), -1):
+                    if ops[j].opcode == "JMP":
+                        skip_jmp_idx = j
+                        break
+                if skip_jmp_idx is None:
+                    continue
 
-            if not skip_jmp:
-                continue
+                jmp_opds = split_operands(ops[skip_jmp_idx].operands_raw)
+                if not jmp_opds:
+                    continue
+                try:
+                    catch_end = int(jmp_opds[0].lstrip("->"))
+                except:
+                    continue
 
-            # Target of skip JMP = position after catch block
-            jmp_opds = split_operands(skip_jmp.operands_raw)
-            if not jmp_opds:
-                continue
-            try:
-                catch_end = int(jmp_opds[0].lstrip("->"))
-            except ValueError:
-                continue
+                try_start = next(
+                    (
+                        s
+                        for s, b in blocks.items()
+                        if b["type"] == "try" and b["catch_end"] == catch_end
+                    ),
+                    None,
+                )
+                if try_start is not None:
+                    # Additional catch for existing try.
+                    # The current catch (either the main one or the last in 'catches') ends HERE.
+                    if not blocks[try_start]["catches"]:
+                        blocks[try_start]["catch_end"] = i
+                    else:
+                        blocks[try_start]["catches"][-1]["end"] = i
 
-            # try_start: code between last flow control point and skip_jmp
-            # Walk back from skip_jmp to find the first op that's a branch target
-            # or a flow control point (JMPZ, FE_FETCH, etc)
-            try_start = 0
-            for j in range(skip_jmp_idx - 1, -1, -1):
-                if ops[j].opcode in ("RECV", "RECV_INIT"):
-                    try_start = j + 1
-                    break
-                # FE_FETCH, JMPZ etc are loop/branch targets — try starts after them
-                if ops[j].opcode in ("FE_FETCH_R", "FE_FETCH_RW", "JMPZ", "JMPNZ",
-                                     "JMPZ_EX", "JMPNZ_EX"):
-                    try_start = j + 1
-                    break
+                    blocks[try_start].setdefault("catches", []).append(
+                        {"exc": exc_type, "end": catch_end, "start_idx": i}
+                    )
+                else:
+                    try_start = 0
+                    for j in range(skip_jmp_idx - 1, -1, -1):
+                        if ops[j].opcode in ("RECV", "RECV_INIT") or any(
+                            b.get("end") == j + 1 for b in blocks.values()
+                        ):
+                            try_start = j + 1
+                            break
+                blocks[try_start] = {
+                    "type": "try",
+                    "end": i,
+                    "catch_exc": exc_type,
+                    "catch_end": catch_end,
+                    "skip_jmp": skip_jmp_idx,
+                    "start": try_start,
+                    "catches": [],
+                }
 
-            catches[i] = {
-                "try_start": try_start,
-                "skip_jmp_idx": skip_jmp_idx,
-                "catch_end": catch_end,
-                "exc_type": exc_type,
-            }
+        # 2. Detect If/Else and Foreach
+        for i, op in enumerate(ops):
+            if op.opcode in ("JMPZ", "JMPNZ", "JMPZ_EX", "JMPNZ_EX"):
+                opds = split_operands(op.operands_raw)
+                if len(opds) < 2:
+                    continue
+                try:
+                    target = int(opds[-1].lstrip("->"))
+                except:
+                    continue
 
-        return catches
+                # Check for else: if JMP before target points even further
+                is_else = False
+                else_target = None
+                if (
+                    target > 0
+                    and target <= len(ops)
+                    and ops[target - 1].opcode == "JMP"
+                ):
+                    else_opds = split_operands(ops[target - 1].operands_raw)
+                    if else_opds:
+                        is_else = True
+                        try:
+                            else_target = int(else_opds[0].lstrip("->"))
+                        except:
+                            is_else = False
+
+                blocks[i] = {
+                    "type": "if",
+                    "end": target,
+                    "is_else": is_else,
+                    "else_end": else_target,
+                    "start": i,
+                }
+
+            elif op.opcode in ("FE_FETCH_R", "FE_FETCH_RW"):
+                opds = split_operands(op.operands_raw)
+                if len(opds) < 2:
+                    continue
+                try:
+                    target = int(opds[-1].lstrip("->"))
+                except:
+                    continue
+                blocks[i] = {"type": "foreach", "end": target, "start": i}
+
+        return blocks
 
     def _function(self, func: FuncDump) -> str:
         ops = func.ops
@@ -430,11 +590,22 @@ class PHPReconstructor:
         params = []
         for op in ops:
             if op.opcode in ("RECV", "RECV_INIT"):
-                php_var = self._rv(op.ret, func)
-                default = ""
                 opds = split_operands(op.operands_raw)
-                if op.opcode == "RECV_INIT" and opds:
-                    default = f" = {fmt(opds[0])}"
+                raw_var = op.ret
+                default = ""
+
+                if raw_var:
+                    # If ret exists, first operand (if any) is the default value
+                    if op.opcode == "RECV_INIT" and opds:
+                        default = f" = {fmt(opds[0])}"
+                else:
+                    # If ret empty, first operand is variable, second (if any) is default
+                    if opds:
+                        raw_var = opds[0]
+                        if op.opcode == "RECV_INIT" and len(opds) >= 2:
+                            default = f" = {fmt(opds[1])}"
+
+                php_var = self._rv(raw_var, func)
                 params.append(f"{php_var}{default}")
 
         param_str = ", ".join(params)
@@ -445,90 +616,234 @@ class PHPReconstructor:
 
         # Call tracking for reconstructing method/function calls
         call_stack = []
+        # Rope folding: accumulate string parts for ROPE_INIT/ADD/END
+        rope_parts = {}
 
-        # -- Phase 1: build renaming map from opcode analysis --
+        # -- Phase 1: build renaming map and blocks from opcode analysis --
         renames = self._build_renames(func)
-
-        # -- Phase 2: find try/catch blocks --
-        catch_map = self._find_catch_blocks(ops)
+        blocks = self._find_blocks(ops)
 
         # Build sets of indices to suppress
         skip_indices = set()
-        for ci, info in catch_map.items():
-            skip_indices.add(info["skip_jmp_idx"])  # suppress skip-catch JMP
-            skip_indices.add(ci)  # suppress CATCH opcode itself
+        for start, info in blocks.items():
+            if info["type"] == "try":
+                skip_indices.add(info["skip_jmp"])
+                skip_indices.add(info["end"])  # suppress CATCH opcode
+            elif info["type"] == "if" and info["is_else"]:
+                skip_indices.add(info["end"] - 1)  # suppress the JMP to else_end
 
-        # Build a map of catch_end positions -> catch_info (for closing braces)
-        catch_end_targets = {}
-        for ci, info in catch_map.items():
-            catch_end_targets[info["catch_end"]] = ci
+        # Track open blocks
+        block_stack = []  # List of info dicts
 
-        # Track open braces for try/catch nesting
-        brace_stack = []  # list of ("try"|"catch", indent_level)
-
-        def current_inner():
-            return indent + "    " + "    " * len(brace_stack)
+        def get_indent():
+            return indent + "    " + "    " * len(block_stack)
 
         for idx, op in enumerate(ops):
             if op.is_dead:
                 continue
-            if idx in skip_indices:
-                continue
 
             # Check if we need to close any blocks at this position
-            while brace_stack:
-                btype, end_pos = brace_stack[-1]
-                if idx >= end_pos:
-                    brace_stack.pop()
-                    close_indent = indent + "    " + "    " * len(brace_stack)
-                    if btype == "try":
-                        # Close try, open catch — end_pos is the catch instruction index
-                        info = catch_map.get(end_pos)
-                        if info is not None:
-                            exc = info["exc_type"]
-                            lines.append(f"{close_indent}}} catch ({exc} $e) {{\n")
-                            brace_stack.append(("catch", info["catch_end"]))
+            while block_stack:
+                last = block_stack[-1]
+                if idx >= last["end"]:
+                    block_stack.pop()
+                    close_indent = indent + "    " + "    " * len(block_stack)
+                    # Special case: IF block ends and starts an ELSE
+                    if last.get("type") == "if" and last.get("is_else"):
+                        else_end = last["else_end"]
+                        lines.append(f"{close_indent}}} else {{\n")
+                        block_stack.append(
+                            {"type": "else", "end": else_end, "start": last["start"]}
+                        )
+
+                    # Special case: TRY block ends and starts a CATCH
+                    elif last.get("type") == "try":
+                        lines.append(
+                            f"{close_indent}}} catch ({last['catch_exc']} $e) {{\n"
+                        )
+                        block_stack.append(
+                            {
+                                "type": "catch",
+                                "end": last["catch_end"],
+                                "start": last["start"],
+                                "catches": last.get("catches", []),
+                            }
+                        )
+
+                    # Special case: CATCH block ends and starts ANOTHER CATCH
+                    elif last.get("type") == "catch" and last.get("catches"):
+                        next_catch = last["catches"].pop(0)
+                        lines.append(
+                            f"{close_indent}}} catch ({next_catch['exc']} $e) {{\n"
+                        )
+                        block_stack.append(
+                            {
+                                "type": "catch",
+                                "end": next_catch["end"],
+                                "start": last["start"],
+                                "catches": last["catches"],
+                            }
+                        )
                     else:
                         lines.append(f"{close_indent}}}\n")
                 else:
                     break
 
-            # Check if a try block starts at this position
-            for ci, info in catch_map.items():
-                if info["try_start"] == idx:
-                    lines.append(f"{current_inner()}try {{\n")
-                    brace_stack.append(("try", ci))
-                    break
+            if idx in skip_indices:
+                continue
 
-            use_inner = current_inner()
+            # Check if a block starts at this position
+            if idx in blocks:
+                info = blocks[idx]
+                curr_indent = get_indent()
+
+                if info["type"] == "try":
+                    lines.append(f"{curr_indent}try {{\n")
+                    block_stack.append(
+                        {
+                            "type": "try",
+                            "end": info["end"],
+                            "start": idx,
+                            "catches": info.get("catches", []),
+                            "catch_exc": info["catch_exc"],
+                            "catch_end": info["catch_end"],
+                        }
+                    )
+                elif info["type"] == "if":
+                    code = self._op(op, func, call_stack, ops, idx)
+                    if code:
+                        code = self._apply_renames(code, renames)
+                        lines.append(f"{curr_indent}{code}\n")
+                    block_stack.append(info)
+                    continue
+                elif info["type"] == "foreach":
+                    code = self._op(op, func, call_stack, ops, idx)
+                    if code:
+                        code = self._apply_renames(code, renames)
+                        lines.append(f"{curr_indent}{code}\n")
+                    block_stack.append(info)
+                    continue
+
+            # Handle CATCH separately as it's the "start" of catch part of try block
+            for start, info in blocks.items():
+                if info["type"] == "try" and info["end"] == idx:
+                    # Closing the try block is handled by 'idx >= info["end"]' logic
+                    pass
+
+            use_inner = get_indent()
+            ret = op.ret
+            opds_local = split_operands(op.operands_raw)
+
+            # Rope folding logic
+            if op.opcode == "ROPE_INIT":
+                if ret:
+                    init_parts = []
+                    # ROPE_INIT operand is the first string piece
+                    if opds_local:
+                        init_parts.append(self._rv(fmt_global(opds_local[0]), func))
+                    rope_parts[ret] = init_parts
+                continue
+            elif op.opcode == "ROPE_ADD":
+                if len(opds_local) >= 2:
+                    handle, piece_tok = opds_local[0], opds_local[1]
+                    if handle in rope_parts:
+                        rope_parts[handle].append(self._rv(fmt_global(piece_tok), func))
+                continue
+            elif op.opcode == "ROPE_END":
+                if opds_local and ret:
+                    handle = opds_local[0]
+                    extra = opds_local[1:]
+                    parts = rope_parts.get(handle, []).copy()
+                    for e in extra:
+                        parts.append(self._rv(fmt_global(e), func))
+                    expr = " . ".join(parts) if parts else "''"
+                    code_local = f"{self._rv(ret, func)} = {expr};"
+                    if handle in rope_parts:
+                        del rope_parts[handle]
+                    lines.append(
+                        f"{use_inner}{self._apply_renames(code_local, renames)}\n"
+                    )
+                    continue
+
+            # Inline throw logic
+            if op.opcode in ("DO_FCALL", "DO_ICALL", "DO_FCALL_BY_NAME"):
+                next_i = idx + 1
+                while next_i < len(ops) and ops[next_i].is_dead:
+                    next_i += 1
+                if next_i < len(ops) and ops[next_i].opcode == "THROW":
+                    if call_stack and call_stack[-1].get("t") == "n":
+                        new_ret = call_stack[-1].get("ret")
+                        if split_operands(ops[next_i].operands_raw)[0] == new_ret:
+                            call = call_stack[-1]
+                            code_local = (
+                                f"throw new {call['cls']}({', '.join(call['args'])});"
+                            )
+                            lines.append(
+                                f"{use_inner}{self._apply_renames(code_local, renames)}\n"
+                            )
+                            call_stack.pop()
+                            skip_indices.add(next_i)
+                            continue
 
             code = self._op(op, func, call_stack, ops, idx)
             if code:
                 code = self._apply_renames(code, renames)
                 lines.append(f"{use_inner}{code}\n")
 
-        # Close remaining open braces
-        while brace_stack:
-            btype, _ = brace_stack.pop()
-            close_indent = indent + "    " + "    " * len(brace_stack)
-            if btype == "try":
-                lines.append(f"{close_indent}}} catch (\\Throwable $e) {{\n")
-                brace_stack.append(("catch", len(ops)))
-            else:
-                lines.append(f"{close_indent}}}\n")
+        # Close any remaining blocks
+        while block_stack:
+            block_stack.pop()
+            close_indent = indent + "    " + "    " * len(block_stack)
+            lines.append(f"{close_indent}}}\n")
 
+        # Remove trailing implicit return; (PHP adds implicit return null)
+        while lines and lines[-1].strip() in ("return;", "return null;"):
+            lines.pop()
         lines.append(f"{indent}}}\n\n")
         return "".join(lines)
 
-    # ------------------------------------------------------------------
-    # Variable renaming heuristics
-    # ------------------------------------------------------------------
+    def _fix_missing_returns(self, func: FuncDump):
+        """Fix cases where VLD doesn't show the return variable of a call."""
+        ops = func.ops
+        assigned_vars = {op.ret for op in ops if op.ret}
+
+        for i in range(len(ops) - 1):
+            op = ops[i]
+            if (
+                op.opcode in ("DO_FCALL", "DO_ICALL", "DO_FCALL_BY_NAME", "DO_UCALL")
+                and not op.ret
+            ):
+                # Look ahead for a variable that is used but not explicitly assigned
+                next_idx = i + 1
+                while next_idx < len(ops) and ops[next_idx].is_dead:
+                    next_idx += 1
+
+                if next_idx < len(ops):
+                    next_op = ops[next_idx]
+                    # Check operands of next opcode
+                    next_opds = split_operands(next_op.operands_raw)
+                    for o in next_opds:
+                        if re.match(r"^[~$]\d+$", o) and o not in assigned_vars:
+                            op.ret = o
+                            assigned_vars.add(o)
+                            break
 
     def _build_renames(self, func: FuncDump) -> Dict[str, str]:
         """Analyze opcodes to suggest human-readable names for temp vars."""
+        self._fix_missing_returns(func)
         renames: Dict[str, str] = {}
-        counters = {"row": 0, "val": 0, "res": 0, "tmp": 0, "str": 0,
-                     "obj": 0, "arr": 0, "cond": 0, "iter": 0, "stmt": 0}
+        counters = {
+            "row": 0,
+            "val": 0,
+            "res": 0,
+            "tmp": 0,
+            "str": 0,
+            "obj": 0,
+            "arr": 0,
+            "cond": 0,
+            "iter": 0,
+            "stmt": 0,
+        }
 
         # Collect all temp vars (~N and $N)
         temp_vars = set()
@@ -543,7 +858,6 @@ class PHPReconstructor:
             suggested = self._suggest_name(var, func, counters)
             if suggested:
                 renames[var] = suggested
-
         return renames
 
     def _suggest_name(self, var: str, func: FuncDump, counters: dict) -> Optional[str]:
@@ -551,9 +865,9 @@ class PHPReconstructor:
         ops = func.ops
 
         # Find all places where this var appears
-        assigned_from = []   # what it's assigned from
-        used_as = []         # how it's used
-        ret_from = []        # opcodes that produce it as return
+        assigned_from = []  # what it's assigned from
+        used_as = []  # how it's used
+        ret_from = []  # opcodes that produce it as return
 
         for i, op in enumerate(ops):
             opds = split_operands(op.operands_raw)
@@ -563,7 +877,11 @@ class PHPReconstructor:
                 ret_from.append(op.opcode)
 
                 # Track what it's assigned from
-                if op.opcode == "FETCH_OBJ_R" or op.opcode == "FETCH_OBJ_IS" or op.opcode == "FETCH_OBJ_FUNC_ARG":
+                if (
+                    op.opcode == "FETCH_OBJ_R"
+                    or op.opcode == "FETCH_OBJ_IS"
+                    or op.opcode == "FETCH_OBJ_FUNC_ARG"
+                ):
                     for o in opds:
                         o_decoded = fmt(o).strip("'")
                         if o_decoded and not re.match(r"^[!~$]\d+$", o_decoded):
@@ -578,7 +896,11 @@ class PHPReconstructor:
                 if op.opcode == "FETCH_THIS":
                     assigned_from.append(("this",))
 
-                if op.opcode == "DO_FCALL" or op.opcode == "DO_ICALL" or op.opcode == "DO_FCALL_BY_NAME":
+                if (
+                    op.opcode == "DO_FCALL"
+                    or op.opcode == "DO_ICALL"
+                    or op.opcode == "DO_FCALL_BY_NAME"
+                ):
                     assigned_from.append(("call",))
 
                 if op.opcode == "ASSIGN":
@@ -598,8 +920,12 @@ class PHPReconstructor:
                 if op.opcode == "COALESCE":
                     assigned_from.append(("coalesce",))
 
-                if op.opcode == "IS_SMALLER" or op.opcode == "IS_SMALLER_OR_EQUAL" or \
-                   op.opcode == "IS_EQUAL" or op.opcode == "IS_NOT_EQUAL":
+                if (
+                    op.opcode == "IS_SMALLER"
+                    or op.opcode == "IS_SMALLER_OR_EQUAL"
+                    or op.opcode == "IS_EQUAL"
+                    or op.opcode == "IS_NOT_EQUAL"
+                ):
                     assigned_from.append(("cmp",))
 
                 if op.opcode == "ISSET_ISEMPTY_DIM_OBJ":
@@ -629,9 +955,8 @@ class PHPReconstructor:
                     continue
                 return f"${prop_name}"
 
-        # Rule 2: assigned from $this (FETCH_THIS) → $self or skip
         if any(s[0] == "this" for s in assigned_from):
-            return None  # $this is implicit, var won't appear much
+            return "$this"
 
         # Rule 3: assigned from FETCH_DIM like ~1['id'] → $id
         for src in assigned_from:
@@ -679,7 +1004,11 @@ class PHPReconstructor:
         for src in assigned_from:
             if src[0] == "qm" and len(src) > 1:
                 source_var = src[1]
-                if re.match(r"^\$\w+$", source_var) and source_var not in ("$this",):
+                if (
+                    re.match(r"^\$[a-zA-Z_]\w*$", source_var)
+                    and source_var not in ("$this",)
+                    and not re.match(r"^\$\d+$", source_var)
+                ):
                     return source_var  # reuse the source name
 
         # Rule 10: used in foreach context
@@ -712,33 +1041,39 @@ class PHPReconstructor:
             code = re.sub(escaped + r"(?![a-zA-Z0-9_])", new, code)
         return code
 
-        for idx, op in enumerate(ops):
-            if op.is_dead:
-                continue
-            code = self._op(op, func, call_stack, ops, idx)
-            if code:
-                lines.append(f"{inner}{code}\n")
-
-        lines.append(f"{indent}}}\n\n")
-        return "".join(lines)
-
-    def _find_next(self, ops: List[OpLine], idx: int, *opcodes: str) -> Optional[OpLine]:
+    def _find_next(
+        self, ops: List[OpLine], idx: int, *opcodes: str
+    ) -> Optional[OpLine]:
         for j in range(idx + 1, min(idx + 4, len(ops))):
             if ops[j].opcode in opcodes:
                 return ops[j]
         return None
 
-    def _op(self, op: OpLine, func: FuncDump, cs: list,
-            ops: List[OpLine], op_idx: int) -> Optional[str]:
+    def _op(
+        self, op: OpLine, func: FuncDump, cs: list, ops: List[OpLine], op_idx: int
+    ) -> Optional[str]:
         o = op.opcode
         opds = split_operands(op.operands_raw)
         ret = op.ret
         rv = lambda v: self._rv(v, func)
+        fmt = lambda v: decode_str(v)
+        fmt_str = fmt_global  # Use for string VALUE contexts (needs backslash escaping)
+
+        if o == "OP_DATA":
+            return None
 
         # -- Suppress noise --
-        if o in ("VERIFY_RETURN_TYPE", "OP_DATA", "CHECK_FUNC_ARG",
-                 "BEGIN_SILENCE", "END_SILENCE", "NOP", "EXT_STMT",
-                 "FE_RESET_R", "FE_RESET_RW"):
+        if o in (
+            "VERIFY_RETURN_TYPE",
+            "OP_DATA",
+            "CHECK_FUNC_ARG",
+            "BEGIN_SILENCE",
+            "END_SILENCE",
+            "NOP",
+            "EXT_STMT",
+            "FE_RESET_R",
+            "FE_RESET_RW",
+        ):
             return None
 
         # -- RECV handled in params, skip here --
@@ -748,7 +1083,7 @@ class PHPReconstructor:
         # -- Return --
         if o == "RETURN":
             if opds:
-                return f"return {rv(fmt(opds[0]))};"
+                return f"return {rv(fmt_str(opds[0]))};"
             if ret:
                 return f"return {rv(ret)};"
             return "return;"
@@ -757,48 +1092,210 @@ class PHPReconstructor:
         if o == "ASSIGN":
             if len(opds) >= 2:
                 target = rv(opds[0])
-                val = rv(fmt(opds[1]))
+                val = rv(fmt_str(opds[1]))
                 return f"{target} = {val};"
 
         # -- ASSIGN_OBJ + OP_DATA pattern --
         if o == "ASSIGN_OBJ":
-            prop = fmt(opds[0]).strip("'") if opds else "?"
+            # property token: either from operands or from ret column
+            if opds:
+                tok = opds[0]
+            elif op.ret:
+                tok = op.ret
+            else:
+                tok = None
+            if tok:
+                if re.match(r"^[!~$]\d+$", tok):
+                    prop = rv(tok)
+                else:
+                    prop = fmt(tok).strip("'")
+            else:
+                prop = "?"
             data = self._find_next(ops, op_idx, "OP_DATA")
             if data:
-                val = rv(data.ret) if data.ret else fmt(data.operands_raw)
+                # OP_DATA typically stores the value in its operands, not in ret
+                opds_data = split_operands(data.operands_raw)
+                if opds_data:
+                    # Use first operand as value
+                    val = rv(fmt_str(opds_data[0]))
+                else:
+                    val = "null"
             else:
                 val = "null"
-            return f"$this->{prop} = {val};"
+            # Format property access: if prop is a variable, use {$var} syntax
+            if isinstance(prop, str) and prop.startswith("$"):
+                prop_formatted = "{" + prop + "}"
+            else:
+                prop_formatted = prop
+            return f"$this->{prop_formatted} = {val};"
 
         # -- FETCH_OBJ write context --
         if o in ("FETCH_OBJ_W", "FETCH_OBJ_RW"):
             if len(opds) >= 2:
                 obj = rv(fmt(opds[0]))
-                prop = fmt(opds[1]).strip("'")
+                tok = opds[1]
+                if re.match(r"^[!~$]\d+$", tok):
+                    prop = rv(tok)
+                else:
+                    prop = fmt(tok).strip("'")
             elif opds:
                 # Implicit $this
-                prop = fmt(opds[0]).strip("'")
+                tok = opds[0]
+                if re.match(r"^[!~$]\d+$", tok):
+                    prop = rv(tok)
+                else:
+                    prop = fmt(tok).strip("'")
                 obj = "$this"
             else:
                 return None
             if ret:
-                return f"{rv(ret)} = {obj}->{prop};"  # write handle
+                # Format property access: if prop is a variable, use {$var} syntax
+                if isinstance(prop, str) and prop.startswith("$"):
+                    prop_formatted = "{" + prop + "}"
+                else:
+                    prop_formatted = prop
+                return f"{rv(ret)} = {obj}->{prop_formatted};"  # write handle
             return None
 
         if o == "FETCH_THIS":
             return None  # implicit
 
-        # -- Property read --
-        if o in ("FETCH_OBJ_R", "FETCH_OBJ_IS", "FETCH_OBJ_FUNC_ARG"):
+        # -- Object / Static Props --
+        if o in (
+            "FETCH_OBJ_R",
+            "FETCH_OBJ_W",
+            "FETCH_OBJ_RW",
+            "FETCH_OBJ_IS",
+            "FETCH_OBJ_FUNC_ARG",
+            "FETCH_OBJ_UNSET",
+        ):
             if len(opds) >= 2:
-                prop = fmt(opds[1]).strip("'")
-                if ret:
-                    return f"{rv(ret)} = $this->{prop};"
+                obj = rv(opds[0])
+                prop_tok = opds[1]
             elif opds:
-                prop = fmt(opds[0]).strip("'")
-                if ret:
-                    return f"{rv(ret)} = $this->{prop};"
-            return None
+                obj = "$this"
+                prop_tok = opds[0]
+            else:
+                return None
+
+            prop = fmt(prop_tok).strip("'\"")
+            if re.match(r"^[!~$]\d+$", prop):
+                prop = "{" + rv(prop) + "}"
+            expr = f"{obj}->{prop}"
+            if ret:
+                return f"{rv(ret)} = {expr};"
+            return expr
+
+        if o in (
+            "FETCH_STATIC_PROP_R",
+            "FETCH_STATIC_PROP_W",
+            "FETCH_STATIC_PROP_RW",
+            "FETCH_STATIC_PROP_FUNC_ARG",
+        ):
+            import sys
+
+            sys.stderr.write(f"DEBUG STATIC: o={o}, raw='{op.operands_raw}'\n")
+            # VLD format: fetch_col  ext_col  return_col  (whitespace separated)
+            # fetch: unknown (or class name?), ext: result variable, return: property name
+            cls_name = "self"
+            prop_tok = None
+            result_var = None
+
+            # Parse raw line
+            raw = op.operands_raw.strip()
+            parts = raw.split()
+            sys.stderr.write(f"DEBUG STATIC: parts={parts}\n")
+            # parts: [fetch, ext, return] or [fetch, ext] or [property]
+            if len(parts) >= 3:
+                # ext column is result variable, return column is property
+                result_var = parts[1]  # ext column
+                prop_tok = parts[2]  # return column
+                # try to get class name from fetch column if it's not 'unknown'
+                if parts[0] != "unknown":
+                    cls_name = fmt(parts[0])
+            elif len(parts) == 2:
+                # Maybe fetch and ext? Not sure.
+                prop_tok = parts[1]
+            elif len(parts) == 1:
+                prop_tok = parts[0]
+            else:
+                prop_tok = "unknown"
+
+            # If opds has something (maybe from split_operands), use that as fallback
+            if not prop_tok or prop_tok == "unknown":
+                if opds:
+                    prop_tok = opds[0]
+                elif op.ret:
+                    prop_tok = op.ret
+
+            sys.stderr.write(
+                f"DEBUG STATIC: prop_tok={prop_tok}, result_var={result_var}\n"
+            )
+            if re.match(r"^[!~$]\d+$", prop_tok):
+                prop = "{" + rv(prop_tok) + "}"
+            else:
+                prop = fmt(prop_tok).strip("'\"")
+
+            expr = f"{cls_name}::${prop}"
+            sys.stderr.write(f"DEBUG STATIC: expr={expr}\n")
+            # If there is a result variable (ext column), assign to it
+            if result_var:
+                return f"{rv(result_var)} = {expr};"
+            if ret:
+                return f"{rv(ret)} = {expr};"
+            return expr
+
+        if o == "ASSIGN_OBJ":
+            if len(opds) >= 3:
+                obj = rv(opds[0])
+                prop_tok = opds[1]
+                val_tok = opds[2]
+            elif len(opds) >= 2:
+                obj = "$this"
+                prop_tok = opds[0]
+                val_tok = opds[1]
+            else:
+                obj = "$this"
+                prop_tok = opds[0] if opds else "unknown"
+                # Look for OP_DATA
+                data_op = self._find_next(ops, op_idx, "OP_DATA")
+                if data_op:
+                    d_opds = split_operands(data_op.operands_raw)
+                    val_tok = d_opds[0] if d_opds else "null"
+                else:
+                    val_tok = "null"
+
+            if re.match(r"^[!~$]\d+$", prop_tok):
+                prop = "{" + rv(prop_tok) + "}"
+            else:
+                prop = fmt(prop_tok).strip("'\"")
+
+            val = rv(fmt(val_tok))
+            return f"{obj}->{prop} = {val};"
+
+        if o == "ASSIGN_STATIC_PROP":
+            if len(opds) >= 3:
+                prop_tok = opds[0]
+                cls_name = fmt(opds[1]) if len(opds) > 1 else "self"
+                val_tok = opds[2]
+            else:
+                prop_tok = opds[0] if opds else "unknown"
+                cls_name = fmt(opds[1]) if len(opds) > 1 else "self"
+                # Look for OP_DATA
+                data_op = self._find_next(ops, op_idx, "OP_DATA")
+                if data_op:
+                    d_opds = split_operands(data_op.operands_raw)
+                    val_tok = d_opds[0] if d_opds else "null"
+                else:
+                    val_tok = "null"
+
+            if re.match(r"^[!~$]\d+$", prop_tok):
+                prop = "{" + rv(prop_tok) + "}"
+            else:
+                prop = fmt(prop_tok).strip("'\"")
+
+            val = rv(fmt(val_tok))
+            return f"{cls_name}::${prop} = {val};"
 
         # -- Array access --
         if o in ("FETCH_DIM_R", "FETCH_DIM_W", "FETCH_DIM_IS"):
@@ -816,7 +1313,15 @@ class PHPReconstructor:
                 key = rv(fmt(opds[1]))
                 data = self._find_next(ops, op_idx, "OP_DATA")
                 if data:
-                    val = rv(data.ret) if data.ret else fmt(data.operands_raw)
+                    # OP_DATA value can be in ret, operands_raw, or ext_val
+                    if data.ret:
+                        val = rv(data.ret)
+                    elif data.operands_raw.strip():
+                        val = rv(fmt(data.operands_raw.strip()))
+                    elif data.ext_val:
+                        val = data.ext_val
+                    else:
+                        val = "null"
                 else:
                     val = "null"
                 return f"{arr}[{key}] = {val};"
@@ -844,8 +1349,25 @@ class PHPReconstructor:
                 cls_name = parts_list[0]
                 method = parts_list[1]
             elif len(parts_list) == 1:
-                cls_name = ""
+                # Single operand — likely method name with implicit self:: or parent::
+                # Common case: parent::__construct or parent::method
                 method = parts_list[0]
+                # Default to 'self::' for static calls within same class
+                # Use 'parent::' for __construct and common parent methods
+                if method in (
+                    "__construct",
+                    "__destruct",
+                    "__get",
+                    "__set",
+                    "__isset",
+                    "__unset",
+                    "before",
+                    "after",
+                    "init",
+                ):
+                    cls_name = "parent"
+                else:
+                    cls_name = "self"
             else:
                 cls_name = ""
                 method = ""
@@ -865,11 +1387,18 @@ class PHPReconstructor:
             cs.append({"t": "f", "fn": fname, "args": []})
             return None
 
-        if o in ("SEND_VAL", "SEND_VAL_EX", "SEND_VAR", "SEND_VAR_EX",
-                  "SEND_REF", "SEND_VAR_NO_REF_EX", "SEND_FUNC_ARG"):
+        if o in (
+            "SEND_VAL",
+            "SEND_VAL_EX",
+            "SEND_VAR",
+            "SEND_VAR_EX",
+            "SEND_REF",
+            "SEND_VAR_NO_REF_EX",
+            "SEND_FUNC_ARG",
+        ):
             if cs:
                 if opds:
-                    cs[-1]["args"].append(rv(fmt(opds[0])))
+                    cs[-1]["args"].append(rv(fmt_str(opds[0])))
                 elif ret:
                     cs[-1]["args"].append(rv(ret))
             return None
@@ -895,45 +1424,42 @@ class PHPReconstructor:
         # -- NEW + DO_FCALL pattern --
         if o == "NEW":
             cls = fmt(opds[0]).strip("'") if opds else "stdClass"
-            cs.append({"t": "n", "cls": cls, "args": []})
+            cs.append({"t": "n", "cls": cls, "args": [], "ret": op.ret})
             return None
 
         # -- Control flow --
-        if o == "JMPZ":
+        if o in ("JMPZ", "JMPNZ", "JMPZ_EX", "JMPNZ_EX"):
             cond = rv(fmt(opds[0])) if opds else "true"
-            target = opds[1] if len(opds) > 1 else "?"
-            return f"if (!({cond})) {{  /* ->{target} */"
-
-        if o in ("JMPNZ_EX",):
-            cond = rv(fmt(opds[0])) if opds else "true"
-            target = opds[1] if len(opds) > 1 else "?"
-            return f"if ({cond}) {{  /* ->{target} */"
+            if "NZ" in o:
+                return f"if ({cond}) {{"
+            return f"if (!({cond})) {{"
 
         if o == "JMP":
-            target = opds[0] if opds else "?"
-            return f"/* goto ->{target} */"
+            return None
 
         if o in ("JMPZ_EX",):
             return None
 
         # -- Foreach --
         if o in ("FE_FETCH_R", "FE_FETCH_RW"):
-            arr = rv(fmt(opds[0])) if opds else "$iter"
-            if len(opds) >= 3:
-                k = rv(opds[1])
-                v = rv(opds[2])
+            # FE_FETCH_R  [~key]  $iter, !value, ->exit
+            # opds: iterator, value, exit_target (->N)
+            # ret: key variable (if foreach($a as $k => $v))
+            arr = rv(fmt(opds[0])) if len(opds) >= 1 else "$iter"
+            v = rv(opds[1]) if len(opds) >= 2 else "$item"
+            # opds[2] is ->N exit target, ignore
+            if ret:
+                # has key: foreach ($arr as $key => $value)
+                k = rv(ret)
                 return f"foreach ({arr} as {k} => {v}) {{"
-            if len(opds) >= 2:
-                v = rv(opds[1])
-                return f"foreach ({arr} as {v}) {{"
-            return f"foreach ({arr} as $item) {{"
+            return f"foreach ({arr} as {v}) {{"
 
         if o == "FE_FREE":
-            return "}"
+            return None  # handled by block stack
 
         # -- Ternary / coalesce --
         if o == "QM_ASSIGN":
-            val = rv(fmt(opds[0])) if opds else "null"
+            val = rv(fmt_str(opds[0])) if opds else "null"
             if ret:
                 return f"{rv(ret)} = {val};"
             return None
@@ -942,20 +1468,31 @@ class PHPReconstructor:
             return None
 
         # -- Comparisons --
-        if o in ("IS_SMALLER", "IS_SMALLER_OR_EQUAL", "IS_EQUAL",
-                  "IS_NOT_EQUAL", "IS_IDENTICAL", "IS_NOT_IDENTICAL"):
+        if o in (
+            "IS_SMALLER",
+            "IS_SMALLER_OR_EQUAL",
+            "IS_EQUAL",
+            "IS_NOT_EQUAL",
+            "IS_IDENTICAL",
+            "IS_NOT_IDENTICAL",
+        ):
             if len(opds) >= 2 and ret:
                 a, b = rv(fmt(opds[0])), rv(fmt(opds[1]))
-                op_map = {"IS_SMALLER": "<", "IS_SMALLER_OR_EQUAL": "<=",
-                          "IS_EQUAL": "==", "IS_NOT_EQUAL": "!=",
-                          "IS_IDENTICAL": "===", "IS_NOT_IDENTICAL": "!=="}
+                op_map = {
+                    "IS_SMALLER": "<",
+                    "IS_SMALLER_OR_EQUAL": "<=",
+                    "IS_EQUAL": "==",
+                    "IS_NOT_EQUAL": "!=",
+                    "IS_IDENTICAL": "===",
+                    "IS_NOT_IDENTICAL": "!==",
+                }
                 return f"{rv(ret)} = {a} {op_map[o]} {b};"
             return None
 
         if o == "ISSET_ISEMPTY_DIM_OBJ":
             if len(opds) >= 2:
-                arr = rv(fmt(opds[0]))
-                key = rv(fmt(opds[1]))
+                arr = rv(fmt_str(opds[0]))
+                key = rv(fmt_str(opds[1]))
                 # ext_val=0 means isset, 1 means empty
                 isset = "isset" if op.ext_val != "1" else "empty"
                 if ret:
@@ -1002,18 +1539,18 @@ class PHPReconstructor:
         if o == "INIT_ARRAY":
             if ret:
                 if len(opds) >= 2:
-                    return f"{rv(ret)} = [{rv(fmt(opds[1]))} => {rv(fmt(opds[0]))}];"
+                    return f"{rv(ret)} = [{rv(fmt_str(opds[1]))} => {rv(fmt_str(opds[0]))}];"
                 if opds:
-                    return f"{rv(ret)} = [{rv(fmt(opds[0]))}];"
+                    return f"{rv(ret)} = [{rv(fmt_str(opds[0]))}];"
                 return f"{rv(ret)} = [];"
             return None
 
         if o == "ADD_ARRAY_ELEMENT":
             if ret:
                 if len(opds) >= 2:
-                    return f"{rv(ret)}[{rv(fmt(opds[1]))}] = {rv(fmt(opds[0]))};"
+                    return f"{rv(ret)}[{rv(fmt_str(opds[1]))}] = {rv(fmt_str(opds[0]))};"
                 if opds:
-                    return f"{rv(ret)}[] = {rv(fmt(opds[0]))};"
+                    return f"{rv(ret)}[] = {rv(fmt_str(opds[0]))};"
             return None
 
         # -- ROPE folding --
@@ -1029,8 +1566,9 @@ class PHPReconstructor:
         # -- CONCAT --
         if o == "CONCAT":
             if len(opds) >= 2 and ret:
-                a, b = rv(fmt(opds[0])), rv(fmt(opds[1]))
+                a, b = rv(fmt_str(opds[0])), rv(fmt_str(opds[1]))
                 return f"{rv(ret)} = {a} . {b};"
+                return line
             return None
 
         # -- THROW --
@@ -1057,6 +1595,10 @@ class PHPReconstructor:
 # ---------------------------------------------------------------------------
 # Batch
 # ---------------------------------------------------------------------------
+
+
+import traceback
+
 
 def process_file(dump_path: Path) -> str:
     text = dump_path.read_text(errors="replace")
@@ -1092,6 +1634,7 @@ def main():
             except Exception as e:
                 err += 1
                 print(f"Error {dp.name}: {e}", file=sys.stderr)
+                traceback.print_exc()
         print(f"Done: {ok} ok, {empty} empty, {err} errors / {len(dumps)} total")
     else:
         code = process_file(args.input)
