@@ -140,6 +140,8 @@ PHP_RINIT_FUNCTION(vld)
 			}
 		}
 		else {
+			zend_compile_file = vld_compile_file;
+			zend_compile_string = vld_compile_string;
 			zend_execute_ex = vld_execute_ex;
 		}
 	}
